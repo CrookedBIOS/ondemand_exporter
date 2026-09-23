@@ -30,6 +30,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -47,7 +48,9 @@ import (
 var (
 	mockedExitStatus = 0
 	mockedStdout     string
-	ctx, _           = context.WithTimeout(context.Background(), 5*time.Second)
+	// Output for specific commands, takes precedence over mockedStdout
+	mockedStdouts = map[string]string{}
+	ctx, _        = context.WithTimeout(context.Background(), 5*time.Second)
 )
 
 func fakeExecCommand(ctx context.Context, command string, args ...string) *exec.Cmd {
@@ -55,8 +58,12 @@ func fakeExecCommand(ctx context.Context, command string, args ...string) *exec.
 	cs = append(cs, args...)
 	cmd := exec.CommandContext(ctx, os.Args[0], cs...)
 	es := strconv.Itoa(mockedExitStatus)
+	stdout, ok := mockedStdouts[command]
+	if !ok {
+		stdout = mockedStdout
+	}
 	cmd.Env = []string{"GO_WANT_HELPER_PROCESS=1",
-		"STDOUT=" + mockedStdout,
+		"STDOUT=" + stdout,
 		"EXIT_STATUS=" + es}
 	return cmd
 }
@@ -115,6 +122,60 @@ bar`
 	}
 	if !reflect.DeepEqual(puns, expPuns) {
 		t.Errorf("Expected %v, got %v", expPuns, puns)
+	}
+}
+
+func TestGetentUIDs(t *testing.T) {
+	execCommand = fakeExecCommand
+	mockedStdouts["getent"] = `foo:x:1001:1001:Foo:/home/foo:/bin/bash
+bar:x:1002:1002:Bar:/home/bar:/bin/bash
+garbage
+baz:x:notanumber:1003:Baz:/home/baz:/bin/bash`
+	defer func() {
+		execCommand = exec.CommandContext
+		delete(mockedStdouts, "getent")
+	}()
+	expUIDs := map[string]string{"foo": "1001", "bar": "1002"}
+	uids := getentUIDs(ctx, []string{"foo", "bar", "baz"}, promslog.NewNopLogger())
+	if !reflect.DeepEqual(uids, expUIDs) {
+		t.Errorf("Expected %v, got %v", expUIDs, uids)
+	}
+}
+
+// PUN users provided by NSS modules such as sssd are not visible to
+// user.Lookup, so they must be resolved with getent instead.
+func TestGetActivePunsNSSUsers(t *testing.T) {
+	if _, err := kingpin.CommandLine.Parse([]string{}); err != nil {
+		t.Fatal(err)
+	}
+	execCommand = fakeExecCommand
+	userLookup = func(username string) (*user.User, error) {
+		if username == "foo" {
+			return &user.User{Uid: "1001"}, nil
+		}
+		return nil, user.UnknownUserError(username)
+	}
+	mockedStdout = `
+foo
+bar`
+	mockedStdouts["getent"] = "bar:x:1002:1002:Bar:/home/bar:/bin/bash"
+	defer func() {
+		execCommand = exec.CommandContext
+		userLookup = user.Lookup
+		delete(mockedStdouts, "getent")
+	}()
+	expPuns := []string{"foo", "bar"}
+	expPunUIDs := []string{"1001", "1002"}
+	puns, punUIDs, err := getActivePuns(ctx, promslog.NewNopLogger())
+	if err != nil {
+		t.Errorf("Unexpected error: %s", err.Error())
+		return
+	}
+	if !reflect.DeepEqual(puns, expPuns) {
+		t.Errorf("Expected %v, got %v", expPuns, puns)
+	}
+	if !reflect.DeepEqual(punUIDs, expPunUIDs) {
+		t.Errorf("Expected %v, got %v", expPunUIDs, punUIDs)
 	}
 }
 
