@@ -250,6 +250,104 @@ bar`
 	}
 }
 
+func TestCollectorPassengerUserLabel(t *testing.T) {
+	if _, err := kingpin.CommandLine.Parse([]string{"--collector.passenger.user-label"}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = kingpin.CommandLine.Parse([]string{}) }()
+	execCommand = fakeExecCommand
+	mockedStdout = `
+foo
+bar`
+	defer func() { execCommand = exec.CommandContext }()
+	_, filename, _, _ := runtime.Caller(0)
+	dir := filepath.Dir(filename)
+	fixture := filepath.Join(dir, "../fixtures/status")
+	fixtureData, err := os.ReadFile(fixture)
+	if err != nil {
+		t.Fatalf("Error loading fixture data: %s", err.Error())
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		_, _ = rw.Write(fixtureData)
+	}))
+	defer server.Close()
+	apacheStatusURL = &server.URL
+	tmpDir, err := os.MkdirTemp(os.TempDir(), "passenger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	passengerStatus := tmpDir + "/ondemand-passenger-status"
+	if err := os.WriteFile(passengerStatus, []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	passengerStatusPath = &passengerStatus
+	passengerStatusExec = func(ctx context.Context, instance string, logger *slog.Logger) (string, error) {
+		return readFixture("passenger-status.out"), nil
+	}
+	passengerStatusExecInstance = func(ctx context.Context, instance string, logger *slog.Logger) (string, error) {
+		return readFixture(fmt.Sprintf("passenger-status-%s.out", instance)), nil
+	}
+	timeNow = func() time.Time {
+		mockNow, _ := time.Parse("01/02/2006", "04/17/2020")
+		return mockNow
+	}
+	cores = func() int {
+		return 1
+	}
+	expected := `
+		# HELP ondemand_passenger_app_average_runtime_seconds Average runtime in seconds of passenger apps
+		# TYPE ondemand_passenger_app_average_runtime_seconds gauge
+		ondemand_passenger_app_average_runtime_seconds{app="/var/www/ood/apps/sys/dashboard",user="lihaoran36"} 35939
+		ondemand_passenger_app_average_runtime_seconds{app="/var/www/ood/apps/sys/dashboard",user="osu10579"} 36800
+		ondemand_passenger_app_average_runtime_seconds{app="/var/www/ood/apps/sys/files",user="osu10579"} 36799
+		# HELP ondemand_passenger_app_count Count of passenger instances of an app
+		# TYPE ondemand_passenger_app_count gauge
+		ondemand_passenger_app_count{app="/var/www/ood/apps/sys/dashboard",user="lihaoran36"} 1
+		ondemand_passenger_app_count{app="/var/www/ood/apps/sys/dashboard",user="osu10579"} 1
+		ondemand_passenger_app_count{app="/var/www/ood/apps/sys/files",user="osu10579"} 1
+		# HELP ondemand_passenger_app_cpu_percent CPU percent of passenger apps
+		# TYPE ondemand_passenger_app_cpu_percent gauge
+		ondemand_passenger_app_cpu_percent{app="/var/www/ood/apps/sys/dashboard",user="lihaoran36"} 1
+		ondemand_passenger_app_cpu_percent{app="/var/www/ood/apps/sys/dashboard",user="osu10579"} 1
+		ondemand_passenger_app_cpu_percent{app="/var/www/ood/apps/sys/files",user="osu10579"} 0
+		# HELP ondemand_passenger_app_processes Process count of an app
+		# TYPE ondemand_passenger_app_processes gauge
+		ondemand_passenger_app_processes{app="/var/www/ood/apps/sys/dashboard",user="lihaoran36"} 1
+		ondemand_passenger_app_processes{app="/var/www/ood/apps/sys/dashboard",user="osu10579"} 1
+		ondemand_passenger_app_processes{app="/var/www/ood/apps/sys/files",user="osu10579"} 1
+		# HELP ondemand_passenger_app_real_memory_bytes Real memory of passenger apps
+		# TYPE ondemand_passenger_app_real_memory_bytes gauge
+		ondemand_passenger_app_real_memory_bytes{app="/var/www/ood/apps/sys/dashboard",user="lihaoran36"} 88461312
+		ondemand_passenger_app_real_memory_bytes{app="/var/www/ood/apps/sys/dashboard",user="osu10579"} 99487744
+		ondemand_passenger_app_real_memory_bytes{app="/var/www/ood/apps/sys/files",user="osu10579"} 42954752
+		# HELP ondemand_passenger_app_requests_total Requests made to passenger apps
+		# TYPE ondemand_passenger_app_requests_total counter
+		ondemand_passenger_app_requests_total{app="/var/www/ood/apps/sys/dashboard",user="lihaoran36"} 122
+		ondemand_passenger_app_requests_total{app="/var/www/ood/apps/sys/dashboard",user="osu10579"} 220
+		ondemand_passenger_app_requests_total{app="/var/www/ood/apps/sys/files",user="osu10579"} 10
+		# HELP ondemand_passenger_app_rss_bytes RSS of passenger apps
+		# TYPE ondemand_passenger_app_rss_bytes gauge
+		ondemand_passenger_app_rss_bytes{app="/var/www/ood/apps/sys/dashboard",user="lihaoran36"} 95961088
+		ondemand_passenger_app_rss_bytes{app="/var/www/ood/apps/sys/dashboard",user="osu10579"} 106766336
+		ondemand_passenger_app_rss_bytes{app="/var/www/ood/apps/sys/files",user="osu10579"} 56840192
+	`
+	logger := promslog.NewNopLogger()
+	collector := NewCollector(logger)
+	gatherers := setupGatherer(collector)
+	if val, err := testutil.GatherAndCount(gatherers); err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	} else if val != 44 {
+		t.Errorf("Unexpected collection count %d, expected 44", val)
+	}
+	if err := testutil.GatherAndCompare(gatherers, strings.NewReader(expected),
+		"ondemand_passenger_app_count", "ondemand_passenger_app_processes",
+		"ondemand_passenger_app_rss_bytes", "ondemand_passenger_app_real_memory_bytes", "ondemand_passenger_app_cpu_percent",
+		"ondemand_passenger_app_requests_total", "ondemand_passenger_app_average_runtime_seconds"); err != nil {
+		t.Errorf("unexpected collecting result:\n%s", err)
+	}
+}
+
 func TestCollectorNoPassengerStatus(t *testing.T) {
 	if _, err := kingpin.CommandLine.Parse([]string{}); err != nil {
 		t.Fatal(err)
